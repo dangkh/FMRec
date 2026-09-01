@@ -126,7 +126,7 @@ def get_history_items(dataset: RecDataset, uid: int) -> List[Dict[str, Any]]:
     """Full observed TRAIN history, oldest to newest."""
     item_ids = dataset.get_user_train_items(uid)[-10:]
     rows = []
-    for item_id in dataset.get_user_train_items(uid):
+    for item_id in item_ids:
         item_id = int(item_id)
         meta = (dataset.item_metadata or {}).get(item_id, {})
         title = clean_text(meta.get("title", ""), 300) or f"Item {item_id}"
@@ -1159,7 +1159,7 @@ def parse_args():
     p.add_argument("--use_instruction",
                    action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use_description",
-                   action=argparse.BooleanOptionalAction, default=False)
+                   action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--max_lesson_facts", type=int, default=3)
     p.add_argument("--max_users", type=int, default=None)
