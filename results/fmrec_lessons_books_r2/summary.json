@@ -1,0 +1,40 @@
+{
+  "method": "FMRec lesson construction",
+  "data_path": "data/processed/instructrec-books/instructrec-books.inter",
+  "user_scope": "all",
+  "n_users": 7377,
+  "failure_definition": "First probe in which the LLM prefers a sampled negative over the validation item",
+  "failure_mining_policy": "Sequential probes; stop after first detected failure",
+  "uses_train_history": true,
+  "uses_instruction": true,
+  "uses_validation_as_positive": true,
+  "uses_test_for_lesson_creation": false,
+  "max_failure_probes": 2,
+  "total_detection_probes_executed": 11821,
+  "attempts_by_probe": {
+    "1": 7377,
+    "2": 4444
+  },
+  "failures_by_probe": {
+    "1": 2933,
+    "2": 1465
+  },
+  "n_detected_failures": 4398,
+  "users_with_failure": 4398,
+  "failure_discovery_coverage": 0.596177307848719,
+  "users_without_detected_failure": 2979,
+  "n_generalized_lessons": 4398,
+  "users_with_usable_lesson": 4398,
+  "lesson_coverage": 0.596177307848719,
+  "llm_stats": {
+    "generate_calls": 2030,
+    "examples": 16220,
+    "seconds": 17495.56609299779,
+    "examples_per_second": 0.9270920365641494
+  },
+  "outputs": {
+    "failure_memory": "results/fmrec_lessons_books_r2/failure_memory.jsonl",
+    "llmrank_lessons": "results/fmrec_lessons_books_r2/lessons_by_user.jsonl",
+    "audit": "results/fmrec_lessons_books_r2/audit.jsonl"
+  }
+}
