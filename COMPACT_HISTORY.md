@@ -296,6 +296,111 @@ in the same SSH session**, never in two steps.
 
 ---
 
+## 6c. STATE AS OF 2026-09-17 — pool+selector experiment READY, blocked by server GPU
+
+**What is installed on the server** (`MEMCF/src/memcf/experiment.py`, md5
+`9a1c7557c42082121df97d2a832c8527`, 12,393 lines; backup of the pre-patch file
+`experiment.py.bak_20260917_084847_pre_pool` md5 `38a0978568083dbd6106e47c24952dc4`;
+py_compile OK; 26/26 unit tests OK):
+- scopes `dense_lgcn_fmrec_pool` / `_random`: ALL lessons of self + ALL lessons of
+  top-N LightGCN donors, sorted by confidence (pool <= 3 + N*3)
+- `--memory_selector heuristic`: zero-LLM selector, score = 3*direct + 2*|cand
+  matches| + 1*|strong history matches| + confidence; drops 0-overlap rows
+- `--memory_selector_neutral_cross`: removes LLM-selector rule 5 ("cross-user
+  needs stronger evidence"), which would otherwise pre-reject the pool
+- **bug fix**: overflow cap used `memory_selector_top_k*2` (=6) and truncated
+  every pool to 6 rows before the selector; now `memory_selector_top_m*2`.
+  All earlier `memcf_llm_select_*` 100u runs were affected.
+- audit: `pool_size_in/pool_own_in/pool_cross_in/neutral_cross` per user
+
+**Plan**: POOL_SELECTOR_PLAN.md. 5 arms x 4 datasets x 2 backbones (Gemma + Qwen,
+one GPU each) = 40 jobs, 20-cand, n=1,000, matched to `ladder_memcfproto_gemma_1000u`
+(Gemma) and `fmrec_ablation_1000u` (Qwen). Smoke-test 20 users first; require
+`pool_size_in` ~15-18 and `memory_selector_fallbacks` = 0.
+
+**2026-09-17 ~14:40 — LAUNCHED. 40/40 running.** Gemma gpu0:8001 (20 jobs), Qwen
+gpu1:8002 (20 jobs), roots `evaluation_results_pool_{gemma,qwen}_1000u`, monitors
+`monitor_pool.sh {gemma,qwen} 20` (logs `monitor_pool_*.log`) kill each vLLM by port
+when 20 summaries land. Server code md5 `b3f7c324ae1bcd5cb857676f6547e017` (heuristic
+= term coverage, no weights; backup `*_pre_coverage`).
+
+Smoke test (20 users, Software, pool5_llm) after fixes: LGCN loaded, retrieved
+8-16/user (cross 211 / own 39), pool reaching selector 12.5, kept 2.8, kept sources
+cross 43 / own 13, fallbacks 0, errors 0, 3,744 tok/call.
+
+Two launcher bugs caught by the smoke test:
+- **`--lightgcn_embeddings_json` was missing** -> no neighbours -> pool = own lessons
+  only (first smoke: pool 2.17, kept 100% same_user). Now passes
+  `lgcn_embeddings_1k_rebuild_v2/<ds>.lgcn_embeddings.json`. `launch_noself1.sh`
+  appears to lack the flag too yet noself1 had cross-user facts -- **verify how
+  noself1 got neighbours before citing C12/C13**.
+- server has **no `curl`**; readiness polling must use python urllib.
+
+Earlier blocker (GPUs down, NVML error) cleared by itself before launch.
+
+**Previous blocker note**: server GPUs are down at the driver level — `nvidia-smi` reports
+`Failed to initialize NVML: Unknown Error`, `torch.cuda.is_available()` is False,
+device_count 0, kernel module 535.309.01 still loaded, uptime 14 d. Needs admin
+(GPU reset / reboot). Nothing of ours is running.
+
+**Local repo**: `experiment_with_fmrec_topk.py` on branch `fmrec-ablation-analysis`
+is now the PATCHED version (md5 9a1c7557...), i.e. ahead of the committed
+`66516fa` (md5 38a0978...). Do not commit until the 40 jobs have run on it, so
+the committed file remains the file that produced the reported numbers.
+
+---
+
+## 6d. STATE AS OF 2026-09-23 -- AgentCF/LLMRank/iAgent baselines, Gemma, 20-cand
+
+User asked to rerun the 3 legacy baselines "same settings" (Gemma, 20-cand,
+runtime_data_rebuild_v2_seed42). User confirmed: **all 3 prior baseline runs on
+this server used Qwen** -- so a fresh Gemma run is new data, not a duplicate.
+
+**Code already on server, no GitHub pull needed:**
+- AgentCF: `AgentCF/AgentCF/agentcf/` (RecBole-based, legacy `openai==0.27.2` in
+  its own venv `.venv_agentcf`; reads `OPENAI_API_BASE`/`OPENAI_API_KEY` env vars)
+- LLMRank: `LLMRank/llmrank/llmrank/` (`.venv_llmrank`, also legacy openai 0.27.2,
+  takes `--api_base` directly)
+- iAgent: `iAgent/` (`.venv`, openai 1.43 new SDK, `--chat_api_base` flag)
+
+**Data prep status (all use `--recall_budget`/candidate cap of 20, matching
+pool/topk protocol):**
+- AgentCF: already had `fair_*_rebuildv2_1000u` for all 4 datasets from an
+  earlier (Qwen) run on 2026-08-07 -- reused as-is, no reconversion needed.
+- LLMRank: converter (`convert_runtime_to_llmrank_fair.py`) had two bugs, both
+  fixed (backups `.bak_*_pre_sortfix`, `.bak_*_pre_seqfix`):
+  1. `sorted(items.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))`
+     crashed (`TypeError: '<' not supported between str and int`) on 3/4
+     datasets because Amazon ASINs mix digit-only and alnum IDs -> the lambda
+     returns mixed types. Fixed to `key=lambda x: str(x)`.
+  2. **Silent version, worse**: `val_item = str(rec.get("val", ""))` turned the
+     list `["B00JZNHUFQ"]` from `user_sequences_10.json` into the literal string
+     `"['B00JZNHUFQ']"`, which never matches any item token -> **every single
+     user got skipped** (`number_of_users_written: 0` for all 4 datasets) while
+     the script exited 0 and printed a clean-looking JSON summary. Caught only
+     by reading the "skipped_users": 1000 line, not by any crash. Fixed to pull
+     `val_list[0]`/`test_list[0]`. Re-ran: 1000/1000 written, 0 skipped, all 4.
+- iAgent: converter worked first try, 1000/1000 users, 20 candidates each,
+  verified via the output .pkl (raw_target present in raw_candidates).
+
+**Launcher**: `launch_baselines.sh <port> <agentcf|llmrank|iagent|smoke|all> [n]`
+on the server, output roots `evaluation_results_{agentcf,llmrank,iagent}_gemma_20cand_matched`.
+AgentCF env-vars its API base (legacy SDK has no CLI flag for it); LLMRank and
+iAgent take it as a flag. `gpu_wait_smoke.sh` is running server-side, waiting
+for CUDA (NVML was down again, same failure mode as 2026-09-17/18 -- clears on
+its own, no fix applied, just wait) to start Gemma on gpu0:8001 and smoke-test
+AgentCF on the pre-existing `smoke_software_rebuildv2_20u` (20 users) before
+the full 4-dataset x 3-baseline batch is launched.
+
+**Not yet done**: smoke-testing LLMRank and iAgent's actual inference call
+(only their data conversion has been verified so far); launching the full batch;
+checking whether AgentCF/LLMRank/iAgent write per-user ranking data (AgentCF's
+summary_json looked aggregate-only in the one sample checked -- may mean no
+paired significance testing against pool/topk arms, same limitation as
+MemRec's original un-patched summaries).
+
+---
+
 ## 7. Status of runs
 
 | Batch | N | Arms | State |

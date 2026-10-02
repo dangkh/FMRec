@@ -5388,11 +5388,24 @@ class MemoryGraphIndex:
         randomize: bool = False,
         shuffle_salt: str = "",
         neighbor_mode: str = "lgcn",
+        pool_all: bool = False,
     ) -> List["GraphRetrievedLesson"]:
         """Faithful port of a collaborator's independent implementation
         (github.com/dangkh/FMRec, scripts/retrieve_fmrec_lessons.py), added
         for a controlled comparison against this project's own mechanisms on
         the same Amazon datasets/LLM/lesson pool.
+
+        `pool_all=True` is the memory-pool variant the collaborator proposed
+        on 2026-09-17: instead of ONE best lesson per donor, gather EVERY
+        lesson of the target user and of each of the top_k_neighbors donors
+        into a single pool ordered by confidence, and leave the choice of
+        which lessons to keep to a downstream selector
+        (`--memory_selector llm|heuristic`) or, with no selector, to
+        `pack_memory_facts` taking the top few by confidence. Neighbour rows
+        keep the consensus_verified tag so the applicability gate passes the
+        whole pool through: the selector, not the gate, is what is under test.
+        The pool is NOT capped at top_k - 1 like the one-per-donor path; the
+        caller widens top_k via memory_selector_top_m.
 
         Deliberately the OPPOSITE design philosophy from
         retrieve_dense_lgcn_userscore_consensus: no consensus requirement,
@@ -5424,6 +5437,40 @@ class MemoryGraphIndex:
             if not rows:
                 return None
             return min(rows, key=lambda l: (-l.confidence, l.memory_id))
+
+        def all_lessons_for(uid: str) -> List[FailureLesson]:
+            return sorted(lessons_by_user.get(uid, []), key=lambda l: (-l.confidence, l.memory_id))
+
+        if pool_all:
+            # ---- memory-pool variant: every lesson of self + every donor ----
+            if include_self:
+                for les in all_lessons_for(user_id):
+                    retrieved.append(GraphRetrievedLesson(
+                        lesson=les,
+                        score=1.0,
+                        sources=["same_user", base_tag, "memory_pool"],
+                        paths=[f"user:{user_id}->{base_tag}_pool_personal->memory:{les.memory_id}"],
+                        matched_evidence_terms=[],
+                    ))
+            query_uv = self._lgcn_user_vec_only(user_id)
+            similar_users = self._lgcn_top_similar_users(
+                user_id, query_uv, top_k_neighbors, randomize, shuffle_salt, base_tag
+            )
+            ranked_neighbors = sorted(similar_users.items(), key=lambda kv: (-kv[1], kv[0]))
+            for neighbor_uid, sim in ranked_neighbors[:top_k_neighbors]:
+                for les in all_lessons_for(neighbor_uid):
+                    retrieved.append(GraphRetrievedLesson(
+                        lesson=les,
+                        score=sim,
+                        sources=["candidate_item", "consensus_verified", base_tag, "memory_pool"],
+                        paths=[f"user:{user_id}->{base_tag}_pool:sim={sim:.3f}->memory:{les.memory_id}"],
+                        matched_evidence_terms=[],
+                    ))
+            # Order the pool by lesson confidence so that with NO selector the
+            # packer's top-k is "most confident lessons in the pool", mixing
+            # own and cross-user, rather than "own lessons first".
+            retrieved.sort(key=lambda r: (-r.lesson.confidence, r.lesson.memory_id))
+            return retrieved[:top_k] if top_k > 0 else retrieved
 
         if include_self:
             own = best_lesson_for(user_id)
@@ -6566,6 +6613,7 @@ class MemoryGraphIndex:
             "dense_lgcn_fmrec_topk", "dense_lgcn_fmrec_topk_random",
             "dense_lgcn_fmrec_topk_shared", "dense_lgcn_fmrec_topk_popular",
             "dense_lgcn_fmrec_topk_noself", "dense_lgcn_fmrec_topk_noself_random",
+            "dense_lgcn_fmrec_pool", "dense_lgcn_fmrec_pool_random",
             "dense_lgcn_rrf", "dense_lgcn_rrf_random",
             "temporal_same", "temporal_exact", "temporal_abstract",
             "temporal_full", "temporal_cross_only", "temporal_shuffled",
@@ -6723,6 +6771,18 @@ class MemoryGraphIndex:
                 include_self=True,
                 randomize=(retrieval_scope == "dense_lgcn_fmrec_topk_random"),
                 shuffle_salt=shuffle_salt,
+            )
+        if retrieval_scope in {"dense_lgcn_fmrec_pool", "dense_lgcn_fmrec_pool_random"}:
+            return self.retrieve_dense_lgcn_fmrec_topk(
+                user_id=user_id,
+                recent_history_ids=recent_history_ids,
+                candidate_ids=candidate_ids,
+                top_k=top_k,
+                top_k_neighbors=fmrec_top_k_neighbors,
+                include_self=True,
+                randomize=(retrieval_scope == "dense_lgcn_fmrec_pool_random"),
+                shuffle_salt=shuffle_salt,
+                pool_all=True,
             )
 
         if retrieval_scope in {"dense_lgcn_rrf", "dense_lgcn_rrf_random"}:
@@ -8127,6 +8187,77 @@ def make_temporal_factual_lesson(
     )
 
 
+def select_memory_facts_heuristic(
+    memory_system: RecommendationMemorySystem,
+    candidate_fact_rows: List[Tuple[str, Dict[str, Any]]],
+    selector_top_k: int = 3,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+    """Rule-based counterpart of select_memory_facts_with_llm_v2: no LLM call,
+    and no hand-set weights.
+
+    Each pooled memory is scored by TERM COVERAGE: the fraction of the
+    lesson's own concrete terms that appear in the current context (the
+    user's history/profile text or the candidate-set text), using the term
+    matches the gate loop already computed for every row:
+
+        coverage = |history_matches U candidate_matches| / |concrete_terms|
+
+    It is a single normalised ratio in [0, 1] -- no per-feature weights, no
+    special cases -- so a lesson whose evidence is mostly present in the
+    current decision ranks above one that only brushes it. Rows with zero
+    coverage are dropped: that is the "irrelevant" a filter is meant to
+    remove. Ties break on lesson confidence, then memory_id. Same-user and
+    cross-user rows are scored identically, matching
+    --memory_selector_neutral_cross on the LLM side.
+    """
+    if not candidate_fact_rows:
+        return [], {"enabled": True, "mode": "heuristic", "reason": "no candidate facts"}
+    selector_top_k = max(0, int(selector_top_k or 0))
+    if selector_top_k == 0:
+        return [], {"enabled": True, "mode": "heuristic", "reason": "selector_top_k=0"}
+
+    scored = []
+    for safe_fact, row in candidate_fact_rows:
+        matched = set(row.get("history_profile_matches") or []) | set(row.get("candidate_matches") or [])
+        n_terms = int(row.get("concrete_term_count") or 0)
+        coverage = (len(matched) / n_terms) if n_terms > 0 else 0.0
+        conf = float(row.get("confidence") or 0.0)
+        scored.append((coverage, conf, safe_fact, row))
+    scored.sort(key=lambda t: (-t[0], -t[1], str(t[3].get("memory_id", ""))))
+
+    kept: List[Tuple[str, Dict[str, Any]]] = []
+    rejected_ids: List[str] = []
+    for coverage, conf, safe_fact, row in scored:
+        if coverage > 0.0 and len(kept) < selector_top_k:
+            row = dict(row)
+            row["heuristic_coverage"] = round(coverage, 4)
+            kept.append((safe_fact, row))
+        else:
+            rejected_ids.append(str(row.get("memory_id", "")))
+
+    pool_own = sum(1 for _, r in candidate_fact_rows if "same_user" in (r.get("sources") or []))
+    memory_system.memory_diagnostics["memory_selector_calls"] += 1
+    memory_system.memory_diagnostics["memory_selector_selected"] += len(kept)
+    memory_system.memory_diagnostics["memory_selector_rejected"] += len(rejected_ids)
+    for _, r in kept:
+        for source in r.get("sources", []):
+            memory_system.memory_diagnostics[f"memory_selector_selected_source_{source}"] += 1
+    audit = {
+        "enabled": True,
+        "mode": "heuristic",
+        "scoring": "term_coverage",
+        "selector_top_k": selector_top_k,
+        "input_memory_count": len(candidate_fact_rows),
+        "pool_own": pool_own,
+        "pool_cross": len(candidate_fact_rows) - pool_own,
+        "selected_ids": [str(r.get("memory_id", "")) for _, r in kept],
+        "selected_coverage": [r.get("heuristic_coverage") for _, r in kept],
+        "rejected_ids": rejected_ids,
+        "fallback_used": False,
+    }
+    return kept, audit
+
+
 def select_memory_facts_with_llm_v2(
     memory_system: RecommendationMemorySystem,
     user_profile: Optional[UserMemoryProfile],
@@ -8136,8 +8267,14 @@ def select_memory_facts_with_llm_v2(
     trace_context: Optional[Dict[str, Any]] = None,
     selector_top_k: int = 3,
     min_relevance: float = 0.60,
+    neutral_cross: bool = False,
 ) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
-    """Select applicable memory facts with an LLM without ranking items."""
+    """Select applicable memory facts with an LLM without ranking items.
+
+    `neutral_cross=True` removes rule 5 (cross-user memories need stronger
+    evidence): with it on, the selector would pre-reject the very cross-user
+    lessons a pooling experiment is trying to evaluate.
+    """
     if not candidate_fact_rows:
         return [], {"enabled": True, "reason": "no candidate facts"}
 
@@ -8188,6 +8325,11 @@ def select_memory_facts_with_llm_v2(
             "profile": str(user_profile.profile or "")[:600],
             "facets": list(user_profile.facets or [])[:8],
         }
+    cross_rule = (
+        "Judge same-user and cross-user memories by the same evidence standard; the source of a memory is not a reason to prefer or reject it."
+        if neutral_cross else
+        "Cross-user memories require stronger evidence than same-user memories."
+    )
 
     prompt = f"""You are a memory applicability selector for a recommender system.
 
@@ -8199,7 +8341,7 @@ Select a memory only if all conditions hold:
 2. It helps distinguish at least one current candidate from another.
 3. It is specific, not a generic category match.
 4. It is not only about a past wrong item unless it also points to a better current alternative.
-5. Cross-user memories require stronger evidence than same-user memories.
+5. {cross_rule}
 6. Do not select a memory solely because it mentions broad words like music, game, beauty, product, item, unknown, CD, vinyl, album, or category.
 
 Return JSON only with this schema:
@@ -8773,6 +8915,8 @@ def read_temporal_lexicographic_memory_v2(
     memory_selector: str = "none",
     memory_selector_top_k: int = 3,
     memory_selector_min_relevance: float = 0.70,
+    memory_selector_top_m: int = 12,
+    memory_selector_neutral_cross: bool = False,
 ) -> Dict[str, Any]:
     """Render pre-routed temporal evidence without scoring or free-form synthesis."""
     retrieval_audit = dict(retrieval_audit or {})
@@ -8846,6 +8990,8 @@ def read_temporal_lexicographic_memory_v2(
         fact_rows.append((rendered, row))
 
     selector_audit = {"enabled": False}
+    pool_size_in = len(fact_rows)
+    pool_own_in = sum(1 for _, r in fact_rows if "same_user" in (r.get("sources") or []))
     if memory_selector == "llm" and fact_rows:
         fact_rows, selector_audit = select_memory_facts_with_llm_v2(
             memory_system=memory_system,
@@ -8856,7 +9002,21 @@ def read_temporal_lexicographic_memory_v2(
             trace_context=trace_context,
             selector_top_k=memory_selector_top_k,
             min_relevance=memory_selector_min_relevance,
+            neutral_cross=memory_selector_neutral_cross,
         )
+    elif memory_selector == "heuristic" and fact_rows:
+        fact_rows, selector_audit = select_memory_facts_heuristic(
+            memory_system=memory_system,
+            candidate_fact_rows=fact_rows,
+            selector_top_k=memory_selector_top_k,
+        )
+    if isinstance(selector_audit, dict):
+        # Real pool size reaching the selector, for the paper: the nominal
+        # top_m is an upper bound, not what the user actually had.
+        selector_audit.setdefault("pool_size_in", pool_size_in)
+        selector_audit.setdefault("pool_own_in", pool_own_in)
+        selector_audit.setdefault("pool_cross_in", pool_size_in - pool_own_in)
+        selector_audit.setdefault("neutral_cross", bool(memory_selector_neutral_cross))
 
     used_facts, packing_audit = pack_memory_facts(
         fact_rows,
@@ -8968,6 +9128,8 @@ def read_graph_lessons_as_facets_v2(
     memory_selector: str = "none",
     memory_selector_top_k: int = 3,
     memory_selector_min_relevance: float = 0.60,
+    memory_selector_top_m: int = 12,
+    memory_selector_neutral_cross: bool = False,
     safe_residual_mode: bool = False,
     safe_residual_min_cross_users: int = 2,
     safe_residual_max_cross_facts: int = 1,
@@ -9076,6 +9238,7 @@ def read_graph_lessons_as_facets_v2(
             "history_profile_matches": history_matches,
             "strong_history_matches": strong_history_matches,
             "candidate_matches": candidate_matches,
+            "concrete_term_count": len(concrete_terms),
             "candidate_support": candidate_support,
             "direct_candidate_match": direct_candidate_match,
             "direct_correct_candidate": direct_correct_candidate,
@@ -9182,8 +9345,11 @@ def read_graph_lessons_as_facets_v2(
             for source in r.sources:
                 memory_system.memory_diagnostics[f"rejected_source_{source}"] += 1
         overflow_limit = max_memory_facts * 2
-        if memory_selector == "llm":
-            overflow_limit = max(overflow_limit, memory_selector_top_k * 2)
+        if memory_selector in {"llm", "heuristic"}:
+            # The selector must see the whole pool. This used to be
+            # memory_selector_top_k * 2 (= 6), which silently truncated any
+            # pool larger than six rows before selection ever ran.
+            overflow_limit = max(overflow_limit, int(memory_selector_top_m or 0) * 2)
         if not safe_residual_mode and overflow_limit > 0 and len(candidate_fact_rows) >= overflow_limit:
             # Keep a small overflow buffer for token-budget packing.
             break
@@ -9275,28 +9441,45 @@ def read_graph_lessons_as_facets_v2(
 
     selector_audit = {"enabled": False}
     deterministic_selected_rows = list(selected_rows)
-    if memory_selector == "llm" and candidate_fact_rows:
-        selected_by_selector, selector_audit = select_memory_facts_with_llm_v2(
-            memory_system=memory_system,
-            user_profile=user_profile,
-            train_items=train_items,
-            candidate_items=candidate_items,
-            candidate_fact_rows=candidate_fact_rows,
-            trace_context=trace_context,
-            selector_top_k=memory_selector_top_k,
-            min_relevance=memory_selector_min_relevance,
-        )
+    pool_size_in = len(candidate_fact_rows)
+    pool_own_in = sum(1 for _, r in candidate_fact_rows if "same_user" in (r.get("sources") or []))
+    if memory_selector in {"llm", "heuristic"} and candidate_fact_rows:
+        if memory_selector == "llm":
+            selected_by_selector, selector_audit = select_memory_facts_with_llm_v2(
+                memory_system=memory_system,
+                user_profile=user_profile,
+                train_items=train_items,
+                candidate_items=candidate_items,
+                candidate_fact_rows=candidate_fact_rows,
+                trace_context=trace_context,
+                selector_top_k=memory_selector_top_k,
+                min_relevance=memory_selector_min_relevance,
+                neutral_cross=memory_selector_neutral_cross,
+            )
+        else:
+            selected_by_selector, selector_audit = select_memory_facts_heuristic(
+                memory_system=memory_system,
+                candidate_fact_rows=candidate_fact_rows,
+                selector_top_k=memory_selector_top_k,
+            )
         selected_ids = {str(row.get("memory_id", "")) for _, row in selected_by_selector}
         selector_rejected_rows = []
         for _, row in candidate_fact_rows:
             if str(row.get("memory_id", "")) in selected_ids:
                 continue
             rejected_row = dict(row)
-            rejected_row["reject_reason"] = "rejected by llm memory selector"
+            rejected_row["reject_reason"] = f"rejected by {memory_selector} memory selector"
             selector_rejected_rows.append(rejected_row)
         rejected.extend(selector_rejected_rows)
         candidate_fact_rows = selected_by_selector
         selected_rows = [row for _, row in candidate_fact_rows]
+    if isinstance(selector_audit, dict):
+        # Real pool size that reached the selector -- the nominal top_m is an
+        # upper bound, not what this user actually had.
+        selector_audit.setdefault("pool_size_in", pool_size_in)
+        selector_audit.setdefault("pool_own_in", pool_own_in)
+        selector_audit.setdefault("pool_cross_in", pool_size_in - pool_own_in)
+        selector_audit.setdefault("neutral_cross", bool(memory_selector_neutral_cross))
 
     used_facts, packing_audit = pack_memory_facts(
         candidate_fact_rows,
@@ -10764,6 +10947,7 @@ def evaluate_user_v2(
     memory_selector_top_m: int = 12,
     memory_selector_top_k: int = 3,
     memory_selector_min_relevance: float = 0.60,
+    memory_selector_neutral_cross: bool = False,
     pairwise_cf_rerank: bool = False,
     pairwise_cf_alpha: float = 0.04,
     pairwise_cf_beta: float = 0.04,
@@ -10867,7 +11051,10 @@ def evaluate_user_v2(
             }
         if failure_constraint_mode == "none" or failure_constraint_with_prompt_memory:
             retrieval_top_k = graph_memory_k
-            if memory_selector == "llm":
+            if memory_selector in {"llm", "heuristic"} or graph_retrieval_scope.startswith("dense_lgcn_fmrec_pool"):
+                # A pool scope must retrieve the whole pool even with no
+                # selector, otherwise it collapses back to top-3-by-confidence
+                # of a 3-row pool, i.e. the old one-per-donor behaviour.
                 retrieval_top_k = max(graph_memory_k, int(memory_selector_top_m or 0))
             if graph_retrieval_scope in {"safe_residual", "directional_residual"}:
                 retrieval_top_k = max(graph_memory_k, int(safe_residual_pool_size or 0))
@@ -10969,6 +11156,8 @@ def evaluate_user_v2(
                     memory_selector=memory_selector,
                     memory_selector_top_k=memory_selector_top_k,
                     memory_selector_min_relevance=memory_selector_min_relevance,
+                    memory_selector_top_m=memory_selector_top_m,
+                    memory_selector_neutral_cross=memory_selector_neutral_cross,
                     safe_residual_mode=(graph_retrieval_scope in {"safe_residual", "directional_residual"}),
                     safe_residual_min_cross_users=safe_residual_min_cross_users,
                     safe_residual_max_cross_facts=safe_residual_max_cross_facts,
@@ -11255,6 +11444,7 @@ def parse_args_v2():
                             "dense_lgcn_fmrec_topk", "dense_lgcn_fmrec_topk_random",
             "dense_lgcn_fmrec_topk_shared", "dense_lgcn_fmrec_topk_popular",
             "dense_lgcn_fmrec_topk_noself", "dense_lgcn_fmrec_topk_noself_random",
+            "dense_lgcn_fmrec_pool", "dense_lgcn_fmrec_pool_random",
                             "oracle_cross_candidate",
                             "dense_lgcn_rrf", "dense_lgcn_rrf_random",
                         ],
@@ -11327,10 +11517,15 @@ def parse_args_v2():
                         help="Initialize/load user profiles but disable graph-memory retrieval during evaluation.")
     parser.add_argument("--disable_user_profile_in_eval_prompt", action="store_true", default=False,
                         help="Do not include the user profile block in evaluation ranking prompts or memory-fact selection.")
-    parser.add_argument("--memory_selector", type=str, default="none", choices=["none", "llm"],
-                        help="Optional memory applicability selector before ranking. It selects memory facts only, not items.")
+    parser.add_argument("--memory_selector", type=str, default="none", choices=["none", "llm", "heuristic"],
+                        help="Optional memory applicability selector before ranking. It selects memory facts only, not items. "
+                             "llm: one extra LLM call judges each pooled memory against history+candidates. "
+                             "heuristic: no LLM call; rank pooled memories by term overlap with history/candidates.")
     parser.add_argument("--memory_selector_top_m", type=int, default=12,
-                        help="When --memory_selector=llm, retrieve at least this many graph memories before selection.")
+                        help="When --memory_selector is llm or heuristic (or the scope is a *_pool scope), retrieve at least this many graph memories before selection.")
+    parser.add_argument("--memory_selector_neutral_cross", action="store_true", default=False,
+                        help="Drop the LLM selector's rule that cross-user memories need stronger evidence than same-user ones. "
+                             "Required for a fair test of cross-user pooling; default off preserves earlier runs.")
     parser.add_argument("--memory_selector_top_k", type=int, default=3,
                         help="When --memory_selector=llm, keep at most this many selected memory facts.")
     parser.add_argument("--memory_selector_min_relevance", type=float, default=0.60,
@@ -11593,6 +11788,11 @@ def main_v2():
             f"_sk{args.memory_selector_top_k}"
             f"_sr{float_tag(args.memory_selector_min_relevance)}"
         )
+        if args.memory_selector_neutral_cross:
+            selector_tag += "_nc1"
+    elif args.graph_retrieval_scope.startswith("dense_lgcn_fmrec_pool"):
+        # pool scope with no selector still widens retrieval; record it
+        selector_tag = f"_selnone_sm{args.memory_selector_top_m}"
     safe_residual_tag = ""
     if args.graph_retrieval_scope in {"safe_residual", "directional_residual"}:
         safe_residual_tag = (
@@ -11858,6 +12058,7 @@ def main_v2():
             memory_selector_top_m=args.memory_selector_top_m,
             memory_selector_top_k=args.memory_selector_top_k,
             memory_selector_min_relevance=args.memory_selector_min_relevance,
+            memory_selector_neutral_cross=args.memory_selector_neutral_cross,
             pairwise_cf_rerank=args.pairwise_cf_rerank,
             pairwise_cf_alpha=args.pairwise_cf_alpha,
             pairwise_cf_beta=args.pairwise_cf_beta,
@@ -12004,6 +12205,7 @@ def main_v2():
         "memory_selector_top_m": args.memory_selector_top_m,
         "memory_selector_top_k": args.memory_selector_top_k,
         "memory_selector_min_relevance": args.memory_selector_min_relevance,
+        "memory_selector_neutral_cross": args.memory_selector_neutral_cross,
         "safe_residual_pool_size": args.safe_residual_pool_size,
         "safe_residual_min_cross_users": args.safe_residual_min_cross_users,
         "safe_residual_max_cross_facts": args.safe_residual_max_cross_facts,
